@@ -1,0 +1,13 @@
+# Add serviceAccountKey.json to .gitignore
+echo "serviceAccountKey.json" >> .gitignore
+echo "*.json" >> .gitignore  # If you have other sensitive JSON files
+
+# Remove the file from git but keep it locally
+git rm --cached serviceAccountKey.json
+
+# Commit the changes
+git add .gitignore
+git commit -m "Add service account key to gitignore and remove from repo"
+
+# Push again
+git push origin mainserviceAccountKey.json
