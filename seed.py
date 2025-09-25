@@ -1,6 +1,7 @@
-# File: seed.py
 from app import db, app
-from models import User, Mechanic, Service, Booking
+from models import User, Mechanic, Service, Booking, MechanicAvailability
+from datetime import datetime
+import calendar
 
 # -----------------------
 # Seed Data
@@ -86,6 +87,31 @@ with app.app_context():
     mech1.services.extend(services[:5])   # Joe Garage offers first 5 services
     mech2.services.extend(services[5:])   # QuickFix Auto offers last 5 services
     db.session.commit()
+    
+    # -----------------------
+    # Seed mechanic availability (necessary for new booking logic)
+    # -----------------------
+    print("\nSeeding default availability for all mechanics...")
+    # Get all days of the week
+    all_days = list(calendar.day_name)
+    
+    # Create a list to hold all new availability records
+    availability_records = []
+    
+    # Iterate through each mechanic and each day to create a record
+    for mechanic in Mechanic.query.all():
+        for day in all_days:
+            # By default, a mechanic is available every day
+            record = MechanicAvailability(
+                mechanic_id=mechanic.id,
+                day_of_week=day,
+                is_available=True
+            )
+            availability_records.append(record)
+            
+    db.session.add_all(availability_records)
+    db.session.commit()
+    print("✅ Availability seeded successfully.")
 
     # -----------------------
     # Create sample bookings

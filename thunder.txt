@@ -1,0 +1,1233 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+# Import the new MechanicAvailability model
+from models import db, User, Mechanic, Service, Booking, mechanic_services, MechanicAvailability 
+from datetime import datetime, timezone
+from sqlalchemy.orm import joinedload
+from sqlalchemy.exc import IntegrityError
+from math import radians, cos, sin, asin, sqrt
+from flask_socketio import SocketIO, emit, join_room
+# Import day names for comparison
+import calendar 
+import os
+# New imports for image handling and Firebase Admin SDK
+from werkzeug.utils import secure_filename
+from firebase_admin import storage
+from firebase_setup import firebase_app # Import the initialized app
+
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///mech_app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db.init_app(app)
+
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+# ------------------------
+# Helper functions
+# ------------------------
+def haversine(lat1, lon1, lat2, lon2):
+    """
+    Calculate the great circle distance between two points on the earth (km)
+    using the Haversine formula.
+    """
+    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    km = 6371 * c
+    return km
+
+
+def send_new_booking_to_mechanic(booking):
+    """Sends a real-time notification to the assigned mechanic via Socket.IO."""
+    mechanic_room = f"mechanic_{booking.mechanic_id}"
+    
+    # Use socketio.emit() instead of emit() for server-side broadcasting
+    socketio.emit("NEW_BOOKING", {
+        "id": booking.id,
+        "type": booking.type,
+        "location": booking.location,
+        "latitude": booking.latitude,
+        "longitude": booking.longitude,
+        "status": booking.status,
+        "customer": {"id": booking.customer.id, "name": booking.customer.name, "phone": booking.customer.phone},
+        "service": {"id": booking.service.id, "name": booking.service.name} if booking.service else None,
+        "created_at": booking.created_at.isoformat() if booking.created_at else None
+    }, room=mechanic_room, namespace="/")
+
+def send_booking_update_to_client(booking):
+    """Sends a real-time booking status update to both the customer and mechanic."""
+    mechanic_room = f"mechanic_{booking.mechanic_id}"
+    customer_room = f"user_{booking.customer_id}"
+
+    booking_data = {
+        "id": booking.id,
+        "type": booking.type,
+        "location": booking.location,
+        "latitude": booking.latitude,
+        "longitude": booking.longitude,
+        "status": booking.status,
+        "customer": {"id": booking.customer.id, "name": booking.customer.name, "phone": booking.customer.phone},
+        "service": {"id": booking.service.id, "name": booking.service.name} if booking.service else None,
+        "mechanic": {"id": booking.mechanic.id, "name": booking.mechanic.name, "phone": booking.mechanic.phone} if booking.mechanic else None,
+        "updated_at": booking.updated_at.isoformat() if booking.updated_at else None
+    }
+    
+    # Broadcast to mechanic's room and customer's room
+    socketio.emit("BOOKING_UPDATED", booking_data, room=mechanic_room, namespace="/")
+    socketio.emit("BOOKING_UPDATED", booking_data, room=customer_room, namespace="/")
+    print(f"✅ BOOKING_UPDATED broadcasted for ID: {booking.id}, Status: {booking.status}")
+
+
+def move_file_to_permanent_location(temp_url, new_path):
+    """
+    Moves a file within the Firebase Storage bucket from a temporary URL to a new path.
+    Returns the new permanent URL.
+    """
+    try:
+        bucket = storage.bucket()
+        temp_blob_name = temp_url.split('/temp_uploads/')[1].split('?')[0]
+        temp_blob = bucket.blob(f'temp_uploads/{temp_blob_name}')
+        
+        # Check if the temporary file exists
+        if not temp_blob.exists():
+            print(f"Temporary file not found: {temp_url}")
+            return None
+
+        # Move the file to the new path
+        new_blob = temp_blob.copy(bucket.blob(new_path))
+
+        # Delete the temporary file
+        temp_blob.delete()
+        
+        return new_blob.public_url
+
+    except Exception as e:
+        print(f"Error moving file: {e}")
+        return None
+
+# ------------------------
+# Routes
+# ------------------------
+
+# -------- Image Upload Endpoint --------
+@app.route('/upload-image', methods=['POST'])
+def upload_image_endpoint():
+    """
+    Handles a file upload from the frontend and saves it to a temporary
+    location in Firebase Storage. Returns the public URL.
+    """
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in the request"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    if file:
+        filename = secure_filename(file.filename)
+        # Create a unique filename to avoid overwrites
+        unique_filename = f"{os.urandom(16).hex()}-{filename}"
+        
+        # Set the destination path to the 'temp_uploads' folder
+        blob_path = f"temp_uploads/{unique_filename}"
+        bucket = storage.bucket()
+        blob = bucket.blob(blob_path)
+
+        # Upload the file directly from the request stream
+        blob.upload_from_file(file, content_type=file.mimetype)
+
+        # Make the blob publicly readable to get a public URL for the client
+        # This is temporary and will be moved later by the signup endpoint
+        blob.make_public()
+
+        return jsonify({"url": blob.public_url}), 200
+    
+    return jsonify({"error": "Something went wrong"}), 500
+
+# -------- Users & Mechanics Authentication --------
+@app.route("/register", methods=["POST"])
+def create_user():
+    data = request.json
+    try:
+        user = User(
+            name=data['name'],
+            email=data['email'],
+            phone=data.get('phone'),
+            password=data['password'],
+            profile_picture=data.get('profile_picture')
+        )
+        db.session.add(user)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Email or phone already exists"}), 400
+
+    return jsonify({"message": "User created", "user": {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "profile_picture": user.profile_picture,
+        "status": user.status
+    }}), 201
+
+
+@app.route("/login", methods=["POST"])
+def login_user():
+    data = request.json
+    email = data.get("email")
+    password = data.get("password")
+
+    # Try to find a user first
+    user = User.query.filter_by(email=email).first()
+    if user and user.password == password:
+        return jsonify({
+            "message": "Login successful",
+            "role": "user",
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "phone": user.phone,
+                "profile_picture": user.profile_picture,
+                "status": user.status
+            }
+        })
+
+    # If not a user, try mechanic
+    mechanic = Mechanic.query.filter_by(email=email).first()
+    if mechanic and mechanic.password == password:
+        return jsonify({
+            "message": "Login successful",
+            "role": "mechanic",
+            "mechanic": {
+                "id": mechanic.id,
+                "name": mechanic.name,
+                "email": mechanic.email,
+                "phone": mechanic.phone,
+                "profile_picture": mechanic.profile_picture,
+                "garage_name": mechanic.garage_name,
+                "garage_location": mechanic.garage_location,
+                "status": mechanic.status
+            }
+        })
+
+    # If neither found
+    return jsonify({"error": "Invalid credentials"}), 401
+
+
+# -------- Mechanics Management --------
+@app.route("/mechanics", methods=["POST"])
+def create_mechanic():
+    data = request.json
+    temp_profile_url = data.get('profile_picture')
+    temp_document_url = data.get('document_path')
+
+    try:
+        # Create the mechanic first to get a user ID
+        mechanic = Mechanic(
+            name=data['name'],
+            email=data['email'],
+            phone=data.get('phone'),
+            password=data['password'],
+            garage_name=data.get('garage_name'),
+            garage_location=data.get('garage_location'),
+            latitude=data.get('latitude'),
+            longitude=data.get('longitude'),
+            # Initially, save the temporary URLs
+            profile_picture=temp_profile_url,
+            document_path=temp_document_url
+        )
+        db.session.add(mechanic)
+        db.session.flush() # Forces creation of ID before commit
+
+        # Now move the files to their permanent, secure locations
+        final_profile_path = f"profile_pictures/{mechanic.id}/{os.path.basename(temp_profile_url)}"
+        final_document_path = f"documents/{mechanic.id}/{os.path.basename(temp_document_url)}"
+
+        final_profile_url = move_file_to_permanent_location(temp_profile_url, final_profile_path)
+        final_document_url = move_file_to_permanent_location(temp_document_url, final_document_path)
+        
+        if not final_profile_url or not final_document_url:
+            db.session.rollback()
+            return jsonify({"error": "Failed to finalize photo uploads. Please try again."}), 500
+        
+        # Update the database with the permanent URLs
+        mechanic.profile_picture = final_profile_url
+        mechanic.document_path = final_document_url
+
+        # Link mechanic to existing services
+        service_ids = data.get('service_ids', [])
+        for sid in service_ids:
+            service = Service.query.get(sid)
+            if service:
+                mechanic.services.append(service)
+        
+        # Initialize availability for the new mechanic (default all days True)
+        default_availability = [
+            MechanicAvailability(mechanic_id=mechanic.id, day_of_week=day, is_available=True)
+            for day in calendar.day_name
+        ]
+        db.session.add_all(default_availability)
+        
+        db.session.commit()
+        
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Email or phone already exists"}), 400
+
+    return jsonify({
+        "message": "Mechanic created",
+        "mechanic": {
+            "id": mechanic.id,
+            "name": mechanic.name,
+            "email": mechanic.email,
+            "phone": mechanic.phone,
+            "profile_picture": mechanic.profile_picture,
+            "garage_name": mechanic.garage_name,
+            "garage_location": mechanic.garage_location,
+            "latitude": mechanic.latitude,
+            "longitude": mechanic.longitude,
+            "services_offered": [{"id": s.id, "name": s.name} for s in mechanic.services]
+        }
+    }), 201
+
+@app.route("/mechanics", methods=["GET"])
+def get_mechanics():
+    """
+    Retrieves all mechanics with their associated services.
+    """
+    try:
+        mechanics = Mechanic.query.options(joinedload(Mechanic.services)).all()
+        result = []
+        for mechanic in mechanics:
+            services_offered = [{"id": s.id, "name": s.name} for s in mechanic.services]
+            result.append({
+                "id": mechanic.id,
+                "name": mechanic.name,
+                "email": mechanic.email,
+                "phone": mechanic.phone,
+                "profile_picture": mechanic.profile_picture,
+                "garage_name": mechanic.garage_name,
+                "garage_location": mechanic.garage_location,
+                "latitude": mechanic.latitude,
+                "longitude": mechanic.longitude,
+                "status": mechanic.status,
+                "services_offered": services_offered
+            })
+        return jsonify(result), 200
+    except Exception as e:
+        print(f"Error fetching mechanics: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/mechanics/<int:mechanic_id>", methods=["GET"])
+def get_mechanic(mechanic_id):
+    """
+    Retrieves a single mechanic's details by ID.
+    """
+    mechanic = Mechanic.query.get(mechanic_id)
+    if not mechanic:
+        return jsonify({"error": "Mechanic not found"}), 404
+
+    jobs_completed = Booking.query.filter_by(
+        mechanic_id=mechanic_id, 
+        status="Completed"
+    ).count()
+
+    return jsonify({
+        "mechanic": {
+            "id": mechanic.id,
+            "name": mechanic.name,
+            "email": mechanic.email,
+            "phone": mechanic.phone,
+            "profile_picture": mechanic.profile_picture,
+            "garage_name": mechanic.garage_name,
+            "garage_location": mechanic.garage_location,
+            "latitude": mechanic.latitude,
+            "longitude": mechanic.longitude,
+            "status": mechanic.status,
+            "services_offered": [{"id": s.id, "name": s.name} for s in mechanic.services],
+            "jobsCompleted": jobs_completed,
+            "rating": 4.8, 
+            "aboutShop": f"Professional auto services at {mechanic.garage_location}" if mechanic.garage_location else "Professional auto services"
+        }
+    })
+
+# -------- Mechanic Availability Routes --------
+@app.route("/mechanics/<int:mechanic_id>/availability", methods=["GET"])
+def get_mechanic_availability(mechanic_id):
+    """
+    Retrieves a single mechanic's availability by ID.
+    """
+    mechanic = Mechanic.query.get(mechanic_id)
+    if not mechanic:
+        return jsonify({"error": "Mechanic not found"}), 404
+
+    availability = MechanicAvailability.query.filter_by(mechanic_id=mechanic_id).all()
+    
+    # Map the database results to the desired frontend format
+    result = {
+        item.day_of_week: item.is_available
+        for item in availability
+    }
+    
+    # Ensure all days are returned, even if not explicitly set (defaults to True)
+    for day in calendar.day_name:
+        if day not in result:
+             # Default to True if the day isn't found in the database
+            result[day] = True 
+            
+    # Convert back to the list structure used by the frontend for consistency
+    frontend_format = [
+        {"day": day, "is_available": result[day]}
+        for day in calendar.day_name
+    ]
+        
+    return jsonify(frontend_format), 200
+
+@app.route("/mechanics/<int:mechanic_id>/availability", methods=["POST"])
+def set_mechanic_availability(mechanic_id):
+    """
+    Sets a mechanic's availability based on a list of day objects.
+    """
+    data = request.json
+    mechanic = Mechanic.query.get(mechanic_id)
+    if not mechanic:
+        return jsonify({"error": "Mechanic not found"}), 404
+        
+    # The expected data format is a list of {"day": "Monday", "is_available": true}
+    if not isinstance(data, list):
+        return jsonify({"error": "Invalid data format. Expected a list of day objects."}), 400
+
+    try:
+        for day_data in data:
+            day_name = day_data.get('day')
+            is_available = day_data.get('is_available')
+
+            if day_name not in calendar.day_name or is_available is None:
+                continue # Skip invalid entries
+
+            # Find or create the availability record
+            availability_record = MechanicAvailability.query.filter_by(
+                mechanic_id=mechanic_id, 
+                day_of_week=day_name
+            ).first()
+
+            if availability_record:
+                # Update existing record
+                availability_record.is_available = is_available
+            else:
+                # Create new record
+                new_record = MechanicAvailability(
+                    mechanic_id=mechanic_id, 
+                    day_of_week=day_name, 
+                    is_available=is_available
+                )
+                db.session.add(new_record)
+        
+        db.session.commit()
+        return jsonify({"message": "Availability updated successfully"}), 200
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error setting availability: {e}")
+        return jsonify({"error": "Failed to update availability"}), 500
+
+
+# -------- Services Management --------
+@app.route("/services", methods=["GET"])
+def get_services():
+    """
+    Retrieves all services.
+    """
+    services = Service.query.all()
+    result = [{"id": s.id, "name": s.name} for s in services]
+    return jsonify(result)
+
+@app.route("/services", methods=["POST"])
+def create_service():
+    """
+    Creates a new service.
+    """
+    data = request.json
+    try:
+        service = Service(name=data['name'])
+        db.session.add(service)
+        db.session.commit()
+        return jsonify({"message": "Service created", "service": {"id": service.id, "name": service.name}}), 201
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Service with that name already exists"}), 400
+
+
+# -------- Bookings Management --------
+@app.route("/bookings", methods=["POST"])
+def create_booking():
+    """
+    Creates a new booking, finds the nearest available mechanic, and notifies them.
+    """
+    data = request.json
+
+    # Validate required fields
+    missing_fields = [f for f in ["customer_id", "service_id", "latitude", "longitude", "location"] if f not in data]
+    if missing_fields:
+        return jsonify({"error": f"Missing field(s): {', '.join(missing_fields)}"}), 400
+
+    user = User.query.get(data['customer_id'])
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    service = Service.query.get(data['service_id'])
+    if not service:
+        return jsonify({"error": "Service not found"}), 404
+        
+    # --- NEW AVAILABILITY CHECK ---
+    # 1. Determine the current day of the week (e.g., 'Thursday')
+    current_day = datetime.now(timezone.utc).strftime('%A')
+    
+    # 2. Get all mechanics offering this service AND join their availability data
+    mechanics_query = db.session.query(Mechanic).join(Mechanic.services).join(Mechanic.availability, isouter=True).filter(
+        Service.id == service.id
+    ).options(
+        joinedload(Mechanic.availability)
+    ).all()
+    
+    available_mechanics = []
+    
+    for m in mechanics_query:
+        # Check if the mechanic has a specific availability record for today
+        availability_record = next(
+            (a for a in m.availability if a.day_of_week == current_day), 
+            None
+        )
+        
+        # Logic: If a record exists and is False, they're unavailable. 
+        # Otherwise (record doesn't exist or is True), they are available by default.
+        is_available = True 
+        if availability_record and not availability_record.is_available:
+            is_available = False
+            
+        if is_available and m.status == 'active': # Also ensure general status is active
+            available_mechanics.append(m)
+
+    if not available_mechanics:
+        return jsonify({"error": "No mechanics available for this service at this time"}), 400
+
+    user_lat = data['latitude']
+    user_lng = data['longitude']
+    
+    # Find nearest mechanic from the filtered list
+    nearest_mechanic = min(
+        available_mechanics,
+        key=lambda m: haversine(user_lat, user_lng, m.latitude, m.longitude)
+    )
+
+    # Create booking
+    booking = Booking(
+        type=service.name,
+        location=data['location'],
+        latitude=user_lat,
+        longitude=user_lng,
+        status="Pending",
+        customer_id=user.id,
+        mechanic_id=nearest_mechanic.id,
+        service_id=service.id
+    )
+    db.session.add(booking)
+    db.session.commit()
+
+    # --- 🔔 Notify mechanic in real-time via Socket.IO ---
+    send_new_booking_to_mechanic(booking)
+
+    # Return full mechanic details
+    mechanic_info = {
+        "id": nearest_mechanic.id,
+        "name": nearest_mechanic.name,
+        "phone": nearest_mechanic.phone,
+        "garage_name": nearest_mechanic.garage_name,
+        "garage_location": nearest_mechanic.garage_location,
+        "latitude": nearest_mechanic.latitude,
+        "longitude": nearest_mechanic.longitude,
+        "services_offered": [s.name for s in nearest_mechanic.services]
+    }
+
+    return jsonify({
+        "message": "Booking created",
+        "booking": {
+            "id": booking.id,
+            "type": booking.type,
+            "location": booking.location,
+            "status": booking.status,
+            "customer": {"id": user.id, "name": user.name},
+            "mechanic": mechanic_info,
+            "service": {"id": service.id, "name": service.name}
+        }
+    }), 201
+
+
+@app.route("/bookings/<int:booking_id>/action", methods=["POST"])
+def handle_booking_action(booking_id):
+    """
+    Handles a mechanic's action on a booking (e.g., Accept, Reject, Complete).
+    """
+    data = request.json
+    action = data.get("action")
+    booking = Booking.query.get(booking_id)
+    if not booking:
+        return jsonify({"error": "Booking not found"}), 404
+
+    if action not in ["Accepted", "Rejected", "Completed"]:
+        return jsonify({"error": "Invalid action"}), 400
+    
+    customer = booking.customer
+    mechanic = booking.mechanic
+
+    booking.status = action
+    booking.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    
+    send_booking_update_to_client(booking)
+
+    return jsonify({
+        "message": f"Booking {action}",
+        "booking": {
+            "id": booking.id,
+            "type": booking.type,
+            "status": booking.status,
+            "customer": {"id": customer.id, "name": customer.name},
+            "mechanic": {"id": mechanic.id, "name": mechanic.name} if mechanic else None,
+            "service": {"id": booking.service.id, "name": booking.service.name} if booking.service else None
+        }
+    })
+
+
+@app.route("/bookings", methods=["GET"])
+def get_bookings():
+    """
+    Retrieves all bookings in the system.
+    """
+    bookings = Booking.query.all()
+    result = []
+    for b in bookings:
+        result.append({
+            "id": b.id,
+            "type": b.type,
+            "location": b.location,
+            "latitude": b.latitude,
+            "longitude": b.longitude,
+            "status": b.status,
+            "customer": {"id": b.customer.id, "name": b.customer.name, "phone": b.customer.phone},
+            "mechanic": {"id": b.mechanic.id, "name": b.mechanic.name, "phone": b.mechanic.phone} if b.mechanic else None,
+            "service": {"id": b.service.id, "name": b.service.name} if b.service else None
+        })
+    return jsonify(result)
+
+
+@app.route("/mechanics/<int:mechanic_id>/bookings", methods=["GET"])
+def get_mechanic_bookings(mechanic_id):
+    """
+    Retrieves all bookings for a specific mechanic.
+    """
+    mechanic = Mechanic.query.get(mechanic_id)
+    if not mechanic:
+        return jsonify({"error": "Mechanic not found"}), 404
+
+    # Eager load customer and service relations
+    bookings = Booking.query.filter_by(mechanic_id=mechanic.id).options(joinedload(Booking.customer), joinedload(Booking.service)).order_by(Booking.created_at.desc()).all()
+    
+    result = []
+    for b in bookings:
+        # NOTE: Ensure you are returning latitude/longitude for the customer pickup
+        result.append({
+            "id": b.id,
+            "type": b.type,
+            "location": b.location,
+            "latitude": b.latitude, # Customer request lat
+            "longitude": b.longitude, # Customer request lng
+            "status": b.status,
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+            "customer": {
+                "id": b.customer.id,
+                "name": b.customer.name,
+                "phone": b.customer.phone
+            },
+            "service": {
+                "id": b.service.id,
+                "name": b.service.name
+            } if b.service else None
+        })
+    return jsonify(result)
+
+@app.route("/bookings/<int:booking_id>", methods=["GET"])
+def get_booking(booking_id):
+    """
+    Retrieves a single booking by ID.
+    """
+    booking = Booking.query.get(booking_id)
+    if not booking:
+        return jsonify({"error": "Booking not found"}), 404
+
+    return jsonify({
+        "id": booking.id,
+        "type": booking.type,
+        "location": booking.location,
+        "latitude": booking.latitude,
+        "longitude": booking.longitude,
+        "status": booking.status,
+        "customer": {
+            "id": booking.customer.id,
+            "name": booking.customer.name,
+            "phone": booking.customer.phone
+        },
+        "mechanic": {
+            "id": booking.mechanic.id,
+            "name": booking.mechanic.name,
+            "phone": booking.mechanic.phone,
+            "garage_name": booking.mechanic.garage_name,
+            "latitude": booking.mechanic.latitude,
+            "longitude": booking.mechanic.longitude
+        } if booking.mechanic else None,
+        "service": {
+            "id": booking.service.id,
+            "name": booking.service.name
+        } if booking.service else None
+    })
+
+# -------- Users Management --------
+@app.route("/users/<int:user_id>", methods=["GET"])
+def get_user(user_id):
+    """
+    Retrieves a user's details by ID.
+    """
+    try:
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        user_data = {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "phone": user.phone,
+            "profile_picture": user.profile_picture,
+            "status": user.status,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "membership": "Premium Member",
+            "bookings_count": len(user.bookings) if user.bookings else 0
+        }
+        
+        return jsonify(user_data), 200
+        
+    except Exception as e:
+        print(f"Error fetching user: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+# -------- Socket.IO Events --------
+@socketio.on("join")
+def on_join(data):
+    """
+    Handles a client joining a specific room (user or mechanic).
+    """
+    mechanic_id = data.get("mechanic_id")
+    user_id = data.get("user_id") 
+    if mechanic_id:
+        join_room(f"mechanic_{mechanic_id}")
+        emit("message", {"info": f"Mechanic {mechanic_id} joined room"}, room=f"mechanic_{mechanic_id}")
+    elif user_id:
+        join_room(f"user_{user_id}")
+        emit("message", {"info": f"User {user_id} joined room"}, room=f"user_{user_id}")
+
+# ------------------------
+# Initialize database
+# ------------------------
+if __name__ == "__main__":
+    with app.app_context():
+        # Ensure the new table is created
+        db.create_all() 
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+
+
+
+    frontend
+
+
+import React, { useState, useEffect } from "react";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  TextInput,
+  Image,
+  ScrollView,
+  Alert,
+  ActivityIndicator,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import * as ImagePicker from "expo-image-picker";
+import * as Location from "expo-location";
+import { useNavigation } from "@react-navigation/native";
+import { API_URL } from "../config"; // Backend URL
+
+export default function MechanicSignupPage() {
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [shopName, setShopName] = useState("");
+  const [shopLocation, setShopLocation] = useState("");
+  const [preciseLocation, setPreciseLocation] = useState(null);
+  const [profilePhoto, setProfilePhoto] = useState(null);
+  const [documentPhoto, setDocumentPhoto] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const [services, setServices] = useState([]); // list from backend
+  const [selectedServices, setSelectedServices] = useState([]); // mechanic selects
+
+  const navigation = useNavigation();
+
+  // Fetch services from backend
+  useEffect(() => {
+    const fetchServices = async () => {
+      try {
+        const res = await fetch(`${API_URL}/services`);
+        const data = await res.json();
+        setServices(data); // data should be an array of service objects {id, name}
+      } catch (err) {
+        console.error("Failed to fetch services:", err);
+        Alert.alert("Error", "Unable to fetch services from server.");
+      }
+    };
+    fetchServices();
+  }, []);
+
+  // Request permissions on component mount
+  useEffect(() => {
+    (async () => {
+      const { status: cameraStatus } = await ImagePicker.requestCameraPermissionsAsync();
+      const { status: libraryStatus } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      
+      if (cameraStatus !== 'granted' || libraryStatus !== 'granted') {
+        Alert.alert('Permissions required', 'Camera and gallery permissions are needed for photo uploads.');
+      }
+    })();
+  }, []);
+
+  // Pick profile photo
+  const pickProfilePhoto = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.8,
+      });
+      if (!result.canceled) setProfilePhoto(result.assets[0].uri);
+    } catch (error) {
+      console.error("Error picking photo:", error);
+      Alert.alert("Error", "Failed to pick photo from gallery.");
+    }
+  };
+
+  const takeSelfie = async () => {
+    try {
+      const result = await ImagePicker.launchCameraAsync({
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.8,
+      });
+      if (!result.canceled) setProfilePhoto(result.assets[0].uri);
+    } catch (error) {
+      console.error("Error taking selfie:", error);
+      Alert.alert("Error", "Failed to take photo with camera.");
+    }
+  };
+
+  // Pick document photo
+  const pickDocumentPhoto = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        quality: 0.8,
+      });
+      if (!result.canceled) setDocumentPhoto(result.assets[0].uri);
+    } catch (error) {
+      console.error("Error picking document:", error);
+      Alert.alert("Error", "Failed to pick document from gallery.");
+    }
+  };
+
+  // Pin precise location
+  const pinPreciseLocation = async () => {
+    let { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== "granted") {
+      Alert.alert("Permission Denied", "Allow location access to pin shop location.");
+      return;
+    }
+    try {
+      let loc = await Location.getCurrentPositionAsync({});
+      setPreciseLocation({
+        latitude: loc.coords.latitude,
+        longitude: loc.coords.longitude,
+      });
+      Alert.alert("Success", "📍 Shop location pinned successfully!");
+    } catch (error) {
+      console.error("Error getting location:", error);
+      Alert.alert("Error", "Failed to get current location.");
+    }
+  };
+
+  // Toggle service selection
+  const toggleService = (serviceId) => {
+    if (selectedServices.includes(serviceId)) {
+      setSelectedServices(selectedServices.filter((id) => id !== serviceId));
+    } else {
+      setSelectedServices([...selectedServices, serviceId]);
+    }
+  };
+
+  // Helper function to upload an image to the backend and return the URL
+  const uploadImage = async (uri, type) => {
+    // Determine the file's name and type from the URI
+    const filename = uri.split('/').pop();
+    const match = /\.(\w+)$/.exec(filename);
+    const mimeType = match ? `image/${match[1]}` : 'image/jpeg';
+
+    const formData = new FormData();
+    // IMPORTANT: The backend must be configured to accept a field named 'image' or 'file'
+    // or whatever you set here. 'file' is a common convention.
+    formData.append('image', {
+      uri,
+      name: filename,
+      type: mimeType,
+    });
+    formData.append('type', type);
+
+    try {
+      const response = await fetch(`${API_URL}/upload-image`, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          'Content-Type': 'multipart/form-data', // Don't manually set this header, FormData handles it.
+        },
+      });
+
+      console.log('Upload response status:', response.status);
+      console.log('Upload response headers:', response.headers);
+      
+      const data = await response.json();
+      console.log('Upload response data:', data);
+
+      if (!response.ok) {
+        // If the server response indicates an error, throw it with the server's message
+        const errorMsg = data.error || data.message || `Failed to upload ${type} photo`;
+        throw new Error(errorMsg);
+      }
+      
+      return data.url; // Backend should return a public URL
+    } catch (error) {
+      console.error(`Error uploading ${type} photo:`, error.message);
+      throw error; // Rethrow the error to be caught by the calling function
+    }
+  };
+
+  // Validation functions
+  const validateEmail = (email) => {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+  };
+
+  const validatePhone = (phone) => {
+    const phoneRegex = /^\+?[\d\s-()]{10,}$/;
+    return phoneRegex.test(phone);
+  };
+
+  // Signup handler
+  const handleSignup = async () => {
+    // Basic validation
+    if (!username || !email || !phone || !password || !confirmPassword || !shopName || !shopLocation) {
+      Alert.alert("Error", "Please fill in all required fields.");
+      return;
+    }
+
+    if (!validateEmail(email)) {
+      Alert.alert("Error", "Please enter a valid email address.");
+      return;
+    }
+
+    if (!validatePhone(phone)) {
+      Alert.alert("Error", "Please enter a valid phone number.");
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      Alert.alert("Error", "Passwords do not match.");
+      return;
+    }
+
+    if (password.length < 6) {
+      Alert.alert("Error", "Password must be at least 6 characters long.");
+      return;
+    }
+
+    if (!profilePhoto || !documentPhoto) {
+      Alert.alert("Error", "Please upload both profile photo and mechanic documents.");
+      return;
+    }
+
+    if (!preciseLocation) {
+      Alert.alert("Error", "Please pin your shop location.");
+      return;
+    }
+
+    if (selectedServices.length === 0) {
+      Alert.alert("Error", "Please select at least one service.");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      // Upload images first and get their public URLs
+      const profilePhotoUrl = await uploadImage(profilePhoto, 'profile');
+      const documentPhotoUrl = await uploadImage(documentPhoto, 'document');
+
+      const body = {
+        name: username,
+        email,
+        phone,
+        password,
+        garage_name: shopName,
+        garage_location: shopLocation,
+        latitude: preciseLocation.latitude,
+        longitude: preciseLocation.longitude,
+        profile_picture: profilePhotoUrl,
+        document_path: documentPhotoUrl,
+        service_ids: selectedServices, // backend expects array of service IDs
+      };
+
+      const res = await fetch(`${API_URL}/mechanics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json();
+
+      if (res.ok) {
+        Alert.alert("Success", "Mechanic account created successfully!");
+        navigation.navigate("Login");
+      } else {
+        Alert.alert("Error", data.error || data.message || "Signup failed");
+      }
+    } catch (err) {
+      console.error("Signup error:", err);
+      Alert.alert("Error", "Unable to complete signup. Please check your network and try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <SafeAreaView className="flex-1 bg-black">
+      <ScrollView contentContainerStyle={{ padding: 20 }} showsVerticalScrollIndicator={false}>
+        <View className="w-full rounded-3xl p-8 space-y-6 border border-white">
+          <Text className="text-3xl font-bold text-white text-center">Mechanic Signup</Text>
+          <Text className="text-gray-400 text-center mb-4">
+            Register as a mechanic by uploading your details
+          </Text>
+
+          {/* Personal Information */}
+          <View className="space-y-4">
+            <Text className="text-white font-semibold text-lg">Personal Information</Text>
+            
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Full Name *"
+              placeholderTextColor="#A0A0A0"
+              value={username}
+              onChangeText={setUsername}
+            />
+
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Email Address *"
+              placeholderTextColor="#A0A0A0"
+              keyboardType="email-address"
+              autoCapitalize="none"
+              value={email}
+              onChangeText={setEmail}
+            />
+
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Phone Number *"
+              placeholderTextColor="#A0A0A0"
+              keyboardType="phone-pad"
+              value={phone}
+              onChangeText={setPhone}
+            />
+
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Password *"
+              placeholderTextColor="#A0A0A0"
+              secureTextEntry
+              value={password}
+              onChangeText={setPassword}
+            />
+
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Confirm Password *"
+              placeholderTextColor="#A0A0A0"
+              secureTextEntry
+              value={confirmPassword}
+              onChangeText={setConfirmPassword}
+            />
+          </View>
+
+          {/* Shop Details */}
+          <View className="space-y-4">
+            <Text className="text-white font-semibold text-lg">Shop Details</Text>
+            
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Shop Name *"
+              placeholderTextColor="#A0A0A0"
+              value={shopName}
+              onChangeText={setShopName}
+            />
+
+            <TextInput
+              className="w-full h-12 px-4 rounded-xl border border-white text-white placeholder-gray-500"
+              placeholder="Shop Location (Street, Area) *"
+              placeholderTextColor="#A0A0A0"
+              value={shopLocation}
+              onChangeText={setShopLocation}
+            />
+
+            <TouchableOpacity
+              className="w-full h-12 bg-white rounded-xl justify-center items-center mt-2"
+              onPress={pinPreciseLocation}
+            >
+              <Text className="text-black font-semibold">
+                {preciseLocation ? "📍 Location Pinned" : "Pin Precise Location *"}
+              </Text>
+            </TouchableOpacity>
+            
+            {preciseLocation && (
+              <Text className="text-green-400 text-sm text-center mt-1">
+                Lat: {preciseLocation.latitude.toFixed(5)}, Lng: {preciseLocation.longitude.toFixed(5)}
+              </Text>
+            )}
+          </View>
+
+          {/* Services */}
+          <View className="space-y-3">
+            <Text className="text-white font-semibold text-lg">Services Offered *</Text>
+            <ScrollView className="max-h-40" nestedScrollEnabled showsVerticalScrollIndicator={false}>
+              {services.map((service) => (
+                <TouchableOpacity
+                  key={service.id}
+                  className={`px-4 py-3 rounded-xl mb-2 border ${
+                    selectedServices.includes(service.id) 
+                      ? "bg-green-500 border-green-500" 
+                      : "bg-gray-800 border-gray-600"
+                  }`}
+                  onPress={() => toggleService(service.id)}
+                >
+                  <Text className="text-white text-center">{service.name}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+            <Text className="text-gray-400 text-xs">
+              Selected: {selectedServices.length} service(s)
+            </Text>
+          </View>
+
+          {/* Profile Photo */}
+          <View className="space-y-3">
+            <Text className="text-white font-semibold text-lg">Profile Photo *</Text>
+            <View className="flex-row space-x-3">
+              <TouchableOpacity 
+                className="flex-1 h-12 bg-white rounded-xl justify-center items-center"
+                onPress={pickProfilePhoto}
+              >
+                <Text className="text-black font-semibold">Upload Photo</Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                className="flex-1 h-12 bg-gray-300 rounded-xl justify-center items-center"
+                onPress={takeSelfie}
+              >
+                <Text className="text-black font-semibold">Take Selfie</Text>
+              </TouchableOpacity>
+            </View>
+            {profilePhoto && (
+              <View className="items-center mt-2">
+                <Image 
+                  source={{ uri: profilePhoto }} 
+                  className="w-24 h-24 rounded-full border-2 border-white"
+                />
+                <Text className="text-green-400 text-sm mt-1">Profile photo selected</Text>
+              </View>
+            )}
+          </View>
+
+          {/* Document Upload */}
+          <View className="space-y-3">
+            <Text className="text-white font-semibold text-lg">Mechanic Document *</Text>
+            <TouchableOpacity 
+              className="w-full h-12 bg-white rounded-xl justify-center items-center"
+              onPress={pickDocumentPhoto}
+            >
+              <Text className="text-black font-semibold">Upload Document</Text>
+            </TouchableOpacity>
+            {documentPhoto && (
+              <View className="items-center mt-2">
+                <Image 
+                  source={{ uri: documentPhoto }} 
+                  className="w-40 h-28 rounded-xl border-2 border-white"
+                />
+                <Text className="text-green-400 text-sm mt-1">Document uploaded</Text>
+              </View>
+            )}
+          </View>
+
+          {/* Signup Button */}
+          <TouchableOpacity
+            className="w-full h-14 bg-white rounded-xl justify-center items-center shadow-lg mt-6"
+            onPress={handleSignup}
+            disabled={loading}
+          >
+            {loading ? (
+              <ActivityIndicator size="small" color="#000" />
+            ) : (
+              <Text className="text-black font-bold text-lg">Create Mechanic Account</Text>
+            )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            className="w-full mt-4"
+            onPress={() => navigation.navigate("Login")}
+          >
+            <Text className="text-white text-center text-sm">
+              Already have an account? <Text className="font-semibold underline">Login here</Text>
+            </Text>
+          </TouchableOpacity>
+
+          <Text className="text-gray-400 text-xs text-center mt-2">
+            * Required fields
+          </Text>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
