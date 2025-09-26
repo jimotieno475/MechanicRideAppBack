@@ -8,6 +8,10 @@ from sqlalchemy.exc import IntegrityError
 from math import radians, cos, sin, asin, sqrt
 from flask_socketio import SocketIO, emit, join_room
 import calendar 
+import base64
+import io
+from PIL import Image
+import re
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
@@ -262,15 +266,55 @@ def update_mechanic_status(mechanic_id):
 def create_user():
     data = request.json
     try:
+        # Handle profile picture if provided as base64
+        profile_picture = data.get('profile_picture')
+        profile_picture_url = None
+        
+        if profile_picture:
+            # Check if it's a base64 string
+            if isinstance(profile_picture, str) and profile_picture.startswith('data:image'):
+                try:
+                    # Extract base64 data from the string
+                    base64_data = re.sub('^data:image/.+;base64,', '', profile_picture)
+                    # Decode base64 string
+                    image_data = base64.b64decode(base64_data)
+                    
+                    # Open image with PIL to validate and process
+                    image = Image.open(io.BytesIO(image_data))
+                    
+                    # Convert to RGB if necessary (handles PNG transparency)
+                    if image.mode in ('RGBA', 'P'):
+                        image = image.convert('RGB')
+                    
+                    # Resize image to reasonable dimensions (optional)
+                    max_size = (500, 500)
+                    image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                    
+                    # Save processed image to bytes
+                    output = io.BytesIO()
+                    image.save(output, format='JPEG', quality=85)
+                    processed_image_data = output.getvalue()
+                    
+                    # Convert back to base64 for storage
+                    profile_picture_url = f"data:image/jpeg;base64,{base64.b64encode(processed_image_data).decode('utf-8')}"
+                    
+                except Exception as e:
+                    print(f"Error processing profile picture: {e}")
+                    return jsonify({"error": "Invalid image format"}), 400
+            else:
+                # Assume it's already a URL or simple string
+                profile_picture_url = profile_picture
+
         user = User(
             name=data['name'],
             email=data['email'],
             phone=data.get('phone'),
             password=data['password'],
-            profile_picture=data.get('profile_picture')
+            profile_picture=profile_picture_url
         )
         db.session.add(user)
         db.session.commit()
+        
     except IntegrityError:
         db.session.rollback()
         return jsonify({"error": "Email or phone already exists"}), 400
@@ -677,6 +721,8 @@ def get_bookings():
             "latitude": b.latitude,
             "longitude": b.longitude,
             "status": b.status,
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+            "updated_at": b.updated_at.isoformat() if b.updated_at else None,
             "customer": {"id": b.customer.id, "name": b.customer.name, "phone": b.customer.phone},
             "mechanic": {"id": b.mechanic.id, "name": b.mechanic.name, "phone": b.mechanic.phone} if b.mechanic else None,
             "service": {"id": b.service.id, "name": b.service.name} if b.service else None
@@ -767,6 +813,7 @@ def get_mechanic_bookings(mechanic_id):
             "longitude": b.longitude, # Customer request lng
             "status": b.status,
             "created_at": b.created_at.isoformat() if b.created_at else None,
+            "updated_at": b.updated_at.isoformat() if b.updated_at else None,
             "customer": {
                 "id": b.customer.id,
                 "name": b.customer.name,
@@ -800,6 +847,7 @@ def get_user_bookings(user_id):
             "longitude": b.longitude,
             "status": b.status,
             "created_at": b.created_at.isoformat() if b.created_at else None,
+            "updated_at": b.updated_at.isoformat() if b.updated_at else None,
             "mechanic": {
                 "id": b.mechanic.id,
                 "name": b.mechanic.name,

@@ -13,16 +13,29 @@ class User(db.Model):
     name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     phone = db.Column(db.String(20), unique=True, nullable=True)
-    profile_picture = db.Column(db.String(200), nullable=True)
+    profile_picture = db.Column(db.Text, nullable=True)  # Changed to Text for larger base64 strings
     password = db.Column(db.String(200), nullable=False)
     status = db.Column(db.String(20), default="active")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     bookings = db.relationship("Booking", back_populates="customer", foreign_keys="Booking.customer_id")
 
+    def to_dict(self):
+        """Convert user object to dictionary for JSON response"""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "email": self.email,
+            "phone": self.phone,
+            "profile_picture": self.profile_picture,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "membership": "Premium Member",  # You can make this dynamic later
+            "bookings_count": len(self.bookings) if self.bookings else 0
+        }
+
     def __repr__(self):
         return f"<User {self.name}>"
-
 
 class Mechanic(db.Model):
     __tablename__ = "mechanics"

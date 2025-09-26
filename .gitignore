@@ -2,6 +2,8 @@
 echo "serviceAccountKey.json" >> .gitignore
 echo "*.json" >> .gitignore  # If you have other sensitive JSON files
 
+serviceAccountKey.json
+
 # Remove the file from git but keep it locally
 git rm --cached serviceAccountKey.json
 
